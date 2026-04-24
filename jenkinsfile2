@@ -1,0 +1,170 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKERHUB_CREDS  = 'dockerhub-creds'           // Jenkins credential ID
+        DOCKERHUB_USER   = 'your_dockerhub_username'   // ← change this
+        IMAGE_NAME       = 'frontend'
+        IMAGE_TAG        = "frontend_${BUILD_NUMBER}"
+        FULL_IMAGE       = "${DOCKERHUB_USER}/${IMAGE_NAME}:frontend_${BUILD_NUMBER}"
+        MANIFEST_FOLDER  = 'k8s'                       // ← change to your actual folder name
+        KUBECONFIG       = '/var/jenkins_home/.kube/config'
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────
+        // STAGE 1: Checkout Code
+        // ─────────────────────────────────────────────
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+                echo "✅ Code checked out successfully"
+                sh 'ls -la'
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 2: Build Docker Image
+        // ─────────────────────────────────────────────
+        stage('Build Docker Image') {
+            steps {
+                sh """
+                    echo "--- Building Docker image ---"
+                    docker build -t ${FULL_IMAGE} .
+                    echo "✅ Docker image built: ${FULL_IMAGE}"
+                    docker images | grep ${IMAGE_NAME}
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 3: Push Docker Image to Docker Hub
+        // ─────────────────────────────────────────────
+        stage('Push Docker Image') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "${DOCKERHUB_CREDS}",
+                    usernameVariable: 'DH_USER',
+                    passwordVariable: 'DH_PASS'
+                )]) {
+                    sh """
+                        echo "--- Logging into Docker Hub ---"
+                        echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
+
+                        echo "--- Pushing image ---"
+                        docker push ${FULL_IMAGE}
+
+                        echo "✅ Image pushed: ${FULL_IMAGE}"
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 4: Cleanup Local Docker Images
+        // ─────────────────────────────────────────────
+        stage('Cleanup Docker Images') {
+            steps {
+                sh """
+                    echo "--- Removing local Docker images ---"
+                    docker rmi -f ${FULL_IMAGE} || true
+                    docker image prune -f || true
+                    echo "✅ Local Docker images cleaned up"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 5: Modify Kubernetes Manifest
+        // ─────────────────────────────────────────────
+        stage('Modify Kubernetes Manifest') {
+            steps {
+                sh """
+                    echo "--- Replacing VERSION placeholder in frontend.yml ---"
+
+                    # Safety: work on a copy so original is untouched
+                    cp ${MANIFEST_FOLDER}/frontend.yml ${MANIFEST_FOLDER}/frontend-deploy.yml
+
+                    # Replace VERSION with actual image tag
+                    sed -i "s|VERSION|${IMAGE_TAG}|g" ${MANIFEST_FOLDER}/frontend-deploy.yml
+
+                    echo "--- Modified manifest preview ---"
+                    cat ${MANIFEST_FOLDER}/frontend-deploy.yml
+
+                    echo "✅ Manifest updated with image tag: ${IMAGE_TAG}"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 6: Deploy to Kubernetes
+        // ─────────────────────────────────────────────
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh """
+                    echo "--- Deploying to Kubernetes ---"
+                    kubectl apply -f ${MANIFEST_FOLDER}/frontend-deploy.yml
+
+                    echo "--- Verifying rollout ---"
+                    kubectl rollout status deployment/frontend \
+                        -n three-tier --timeout=180s
+
+                    echo "--- Pod status ---"
+                    kubectl get pods -n three-tier -l app=frontend -o wide
+
+                    echo "--- Service status ---"
+                    kubectl get svc -n three-tier
+
+                    echo "✅ Frontend deployed successfully"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 7: Archive Manifest as Artifact
+        // ─────────────────────────────────────────────
+        stage('Publish Artifact') {
+            steps {
+                archiveArtifacts artifacts: "${MANIFEST_FOLDER}/frontend-deploy.yml",
+                                 fingerprint: true,
+                                 allowEmptyArchive: false
+                echo "✅ Manifest archived as Jenkins artifact"
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+            ========================================
+            ✅ FRONTEND DEPLOYMENT SUCCESSFUL
+            Image     : ${FULL_IMAGE}
+            Namespace : three-tier
+            Build     : #${BUILD_NUMBER}
+            ========================================
+            """
+        }
+        failure {
+            echo "❌ PIPELINE FAILED — collecting debug info..."
+            sh '''
+                echo "--- Pod list ---"
+                kubectl get pods -n three-tier || true
+
+                echo "--- Pod describe ---"
+                kubectl describe pods -n three-tier -l app=frontend || true
+
+                echo "--- Pod logs ---"
+                kubectl logs -l app=frontend -n three-tier --tail=50 || true
+
+                echo "--- Events ---"
+                kubectl get events -n three-tier --sort-by=.lastTimestamp || true
+            '''
+        }
+        always {
+            echo "Pipeline finished at: ${new Date()}"
+            sh 'docker logout || true'
+        }
+    }
+}
