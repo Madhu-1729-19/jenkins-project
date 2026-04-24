@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         DOCKERHUB_CREDS  = 'dockerhub-creds'           // Jenkins credential ID
-        DOCKERHUB_USER   = 'your_dockerhub_username'   // ← change this
+        DOCKERHUB_USER   = 'madhu172'   // ← change this
         IMAGE_NAME       = 'frontend'
         IMAGE_TAG        = "frontend_${BUILD_NUMBER}"
         FULL_IMAGE       = "${DOCKERHUB_USER}/${IMAGE_NAME}:frontend_${BUILD_NUMBER}"
